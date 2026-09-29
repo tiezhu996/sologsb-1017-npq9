@@ -63,6 +63,26 @@ const dayNightOptions = ['白天', '夜', '清晨', '黄昏', '傍晚']
 const timePeriods = ['白天', '夜', '清晨', '黄昏', '傍晚']
 const searchFields = ['slug', 'synopsis', 'location', 'storyTime', 'reason'] as const
 
+const revisionLabels: Record<RevisionColor, string> = {
+  white: '白纸', blue: '蓝', pink: '粉', yellow: '黄', green: '绿', goldenrod: '金菊', buff: '浅黄', salmon: '鲑粉', cherry: '樱桃'
+}
+const statusLabels: Record<WarningStatus, string> = { pending: '待审', accepted: '已接受', ignored: '已忽略' }
+
+function ConclusionTag({ revision, status, decidedAt, invalid }: { revision: RevisionColor; status: WarningStatus; decidedAt?: string; invalid?: boolean }) {
+  return (
+    <Tooltip title={decidedAt ? `结论版本：${revisionLabels[revision]}版 · ${new Date(decidedAt).toLocaleString('zh-CN')}` : `当前修订色：${revisionLabels[revision]}版`}>
+      <Chip
+        size="small"
+        className="conclusion-tag"
+        icon={<span className={`revision-dot revision-${revision}`} />}
+        label={`${revisionLabels[revision]}版 · ${statusLabels[status]}${invalid ? ' · 已失效' : ''}`}
+        color={status === 'accepted' ? 'success' : status === 'ignored' ? 'default' : 'warning'}
+        variant={invalid ? 'outlined' : 'filled'}
+      />
+    </Tooltip>
+  )
+}
+
 function Highlight({ text, query }: { text: string; query: string }) {
   if (!query.trim()) return <>{text}</>
   const index = text.toLowerCase().indexOf(query.toLowerCase())
@@ -119,10 +139,14 @@ export default function App() {
   const searchRef = useRef<HTMLInputElement>(null)
 
   const selectedScene = state.script.scenes.find((scene) => scene.id === selectedSceneId) ?? state.script.scenes[0]
-  const pendingWarnings = warnings.filter((warning) => (state.reviews[warning.id]?.status ?? 'pending') === 'pending')
-  const visibleWarnings = warnings.filter((warning) => warningFilter === 'all' || (state.reviews[warning.id]?.status ?? 'pending') === warningFilter)
+  const reviewStatusOf = (warningId: string): WarningStatus => state.reviews[warningId]?.current.status ?? 'pending'
+  const pendingWarnings = warnings.filter((warning) => reviewStatusOf(warning.id) === 'pending')
+  const visibleWarnings = warnings.filter((warning) => warningFilter === 'all' || reviewStatusOf(warning.id) === warningFilter)
   const selectedVersion = state.versions.find((version) => version.id === selectedVersionId) ?? state.versions[0]
-  const diff = useMemo(() => selectedVersion ? diffScript(selectedVersion.script, state.script) : [], [selectedVersion, state.script])
+  const diff = useMemo(
+    () => selectedVersion ? diffScript(selectedVersion.script, state.script, selectedVersion.reviews ?? {}, state.reviews) : [],
+    [selectedVersion, state.script, state.reviews]
+  )
   const searchResults = useMemo(() => {
     const normalized = query.trim().toLowerCase()
     if (!normalized) return []
@@ -343,12 +367,13 @@ export default function App() {
         </Stack>
         <Stack gap={1.5}>
           {visibleWarnings.map((warning) => {
-            const review = state.reviews[warning.id] ?? { status: 'pending' as WarningStatus, replies: [] }
+            const review = state.reviews[warning.id] ?? { history: [], current: { revision: 'white' as RevisionColor, signature: warning.signature, status: 'pending' as WarningStatus, decidedAt: '', replies: [] } }
+            const round = review.current
             const scene = state.script.scenes.find((item) => item.id === warning.sceneId)
             return (
               <Paper
                 key={warning.id}
-                className={`warning-panel status-${review.status}`}
+                className={`warning-panel status-${round.status}`}
                 elevation={0}
                 onFocus={() => setSelectedSceneId(warning.sceneId)}
                 tabIndex={0}
@@ -360,20 +385,42 @@ export default function App() {
                       <Typography variant="h6">{warning.title}</Typography>
                       <Chip size="small" label={`场景 ${scene?.number ?? '-'}`} onClick={() => openScene(warning.sceneId)} />
                       <Chip size="small" variant="outlined" label={warning.type === 'character' ? '人物' : warning.type === 'prop' ? '道具' : warning.type === 'wardrobe' ? '服装' : '时间线'} />
+                      <ConclusionTag revision={round.revision} status={round.status} decidedAt={round.decidedAt} />
                     </Stack>
                     <Typography mt={1}>{warning.detail}</Typography>
                     <Typography variant="body2" color="text.secondary" mt={.5}>建议：{warning.suggestion}</Typography>
                   </Box>
-                  <Chip label={review.status === 'accepted' ? '已接受' : review.status === 'ignored' ? '已忽略' : '待审'} color={review.status === 'accepted' ? 'success' : review.status === 'ignored' ? 'default' : 'warning'} />
+                  <Chip label={statusLabels[round.status]} color={round.status === 'accepted' ? 'success' : round.status === 'ignored' ? 'default' : 'warning'} />
                 </Box>
+                {round.status === 'pending' && (
+                  <Typography variant="body2" className="re-review-note">
+                    {review.history.length > 0
+                      ? '场景内容或修订色已变化，上一版结论转为待审；原回复保留在下方案例中。'
+                      : '该问题尚待审阅，结论会跟随当前修订色保存。'}
+                  </Typography>
+                )}
                 <Stack direction="row" gap={1} mt={1.5} flexWrap="wrap">
-                  <Button size="small" variant={review.status === 'accepted' ? 'contained' : 'outlined'} startIcon={<CheckCircle />} onClick={() => store.setReviewStatus(warning.id, 'accepted')}>接受问题</Button>
-                  <Button size="small" variant={review.status === 'ignored' ? 'contained' : 'outlined'} color="inherit" startIcon={<Block />} onClick={() => store.setReviewStatus(warning.id, 'ignored')}>忽略警告</Button>
+                  <Button size="small" variant={round.status === 'accepted' ? 'contained' : 'outlined'} startIcon={<CheckCircle />} onClick={() => store.setReviewStatus(warning.id, 'accepted')}>接受问题</Button>
+                  <Button size="small" variant={round.status === 'ignored' ? 'contained' : 'outlined'} color="inherit" startIcon={<Block />} onClick={() => store.setReviewStatus(warning.id, 'ignored')}>忽略警告</Button>
                   <Button size="small" onClick={() => openScene(warning.sceneId)}>打开场景</Button>
                 </Stack>
-                {review.replies.length > 0 && (
+                {[...review.history].reverse().map((past, historyIndex) => past.replies.length > 0 && (
+                  <Box key={`${past.revision}-${past.decidedAt || historyIndex}`} className="reply-list reply-history">
+                    <Typography variant="caption" className="reply-history-label">
+                      上一版说明 · {revisionLabels[past.revision]}版结论（{statusLabels[past.status]}{past.decidedAt ? ` · ${new Date(past.decidedAt).toLocaleString('zh-CN')}` : ''}）
+                    </Typography>
+                    {past.replies.map((reply) => (
+                      <Box key={reply.id} className="reply-item">
+                        <strong>{reply.author}</strong>
+                        <span>{reply.text}</span>
+                        <small>{new Date(reply.createdAt).toLocaleString('zh-CN')}</small>
+                      </Box>
+                    ))}
+                  </Box>
+                ))}
+                {round.replies.length > 0 && (
                   <Box className="reply-list">
-                    {review.replies.map((reply) => (
+                    {round.replies.map((reply) => (
                       <Box key={reply.id} className="reply-item">
                         <strong>{reply.author}</strong>
                         <span>{reply.text}</span>
@@ -426,14 +473,21 @@ export default function App() {
           <Paper className="version-list" elevation={0}>
             <Typography variant="h6">历史版本</Typography>
             <List disablePadding>
-              {state.versions.map((version) => (
-                <ListItemButton key={version.id} selected={version.id === selectedVersion?.id} onClick={() => setSelectedVersionId(version.id)}>
-                  <Box>
-                    <Typography fontWeight={700}>{version.name}</Typography>
-                    <Typography variant="caption" color="text.secondary">{new Date(version.createdAt).toLocaleString('zh-CN')}</Typography>
-                  </Box>
-                </ListItemButton>
-              ))}
+              {state.versions.map((version) => {
+                const frozen = Object.values(version.reviews ?? {})
+                const decidedCount = frozen.filter((review) => review.current.status !== 'pending').length
+                return (
+                  <ListItemButton key={version.id} selected={version.id === selectedVersion?.id} onClick={() => setSelectedVersionId(version.id)}>
+                    <Box>
+                      <Typography fontWeight={700}>{version.name}</Typography>
+                      <Typography variant="caption" color="text.secondary">{new Date(version.createdAt).toLocaleString('zh-CN')}</Typography>
+                      <Typography variant="caption" display="block" color="text.secondary">
+                        冻结审阅 {decidedCount} 条结论 / {frozen.reduce((total, review) => total + review.current.replies.length + review.history.reduce((count, round) => count + round.replies.length, 0), 0)} 条回复
+                      </Typography>
+                    </Box>
+                  </ListItemButton>
+                )
+              })}
             </List>
             {!state.versions.length && <Typography color="text.secondary" mt={2}>尚无历史版本。</Typography>}
           </Paper>
@@ -448,12 +502,18 @@ export default function App() {
             <Divider />
             <Box className="diff-list">
               {diff.map((item) => (
-                <Box key={item.id} className="diff-row">
+                <Box key={item.id} className={`diff-row ${item.kind === 'review' ? 'diff-review' : ''}`}>
                   <Chip size="small" label={`场景 ${item.sceneNumber}`} />
                   <strong>{item.field}</strong>
-                  <span className="diff-before">{item.before || '空'}</span>
+                  <span className="diff-before">
+                    {item.review?.beforeRevision && <span className={`revision-dot revision-${item.review.beforeRevision}`} title={`${revisionLabels[item.review.beforeRevision]}版`} />}
+                    {item.before || '空'}
+                  </span>
                   <span className="diff-arrow">→</span>
-                  <span className="diff-after">{item.after || '空'}</span>
+                  <span className="diff-after">
+                    {item.review?.afterRevision && <span className={`revision-dot revision-${item.review.afterRevision}`} title={`${revisionLabels[item.review.afterRevision]}版`} />}
+                    {item.after || '空'}
+                  </span>
                 </Box>
               ))}
               {selectedVersion && !diff.length && <Alert severity="success">当前工作稿与该版本一致。</Alert>}
@@ -651,7 +711,7 @@ export default function App() {
       <Dialog open={versionDialog} onClose={() => setVersionDialog(false)} fullWidth maxWidth="sm">
         <DialogTitle>保存剧本版本</DialogTitle>
         <DialogContent>
-          <Typography color="text.secondary" mb={2}>版本会保存当前全部场景、资料库和审阅备注的快照，之后可与工作稿比较或恢复。</Typography>
+          <Typography color="text.secondary" mb={2}>版本会冻结当前全部场景、资料库以及每条警告的审阅结论（含修订色与回复），恢复后原样显示当时的判断。</Typography>
           <TextField autoFocus fullWidth label="版本名称" value={versionName} onChange={(event) => setVersionName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') createVersion() }} />
         </DialogContent>
         <DialogActions><Button onClick={() => setVersionDialog(false)}>取消</Button><Button variant="contained" onClick={createVersion}>保存</Button></DialogActions>
