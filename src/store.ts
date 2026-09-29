@@ -1,22 +1,118 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { sampleScript } from './sample'
-import type { Character, ContinuityState, DiffItem, Prop, Reply, Scene, Script, Version, Wardrobe, WarningItem, WarningReview } from './types'
+import type {
+  Character,
+  ContinuityState,
+  DiffItem,
+  Prop,
+  Reply,
+  ReviewConclusionDiff,
+  ReviewMap,
+  ReviewRecord,
+  ReviewThread,
+  RevisionColor,
+  Scene,
+  Script,
+  Version,
+  Wardrobe,
+  WarningItem,
+  WarningStatus
+} from './types'
 
-const STORAGE_KEY = 'sologsb-1017-continuity-v1'
-const clone = <T,>(value: T): T => structuredClone(value)
-const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+const STORAGE_KEY = 'sologsb-1017-constinuity-v1'
+const WHITE: RevisionColor = 'white'
+const revisionColors: RevisionColor[] = ['white', 'blue', 'pink', 'yellow', 'green', 'goldenrod', 'buff', 'salmon', 'cherry']
+function clone<T>(value: T): T { return structuredClone(value) }const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 
-function initialState(): ContinuityState {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw) as ContinuityState
-      if (parsed.script?.scenes?.length) return parsed
-    }
-  } catch {
-    // Ignore an invalid local draft and restore the bundled example.
+export const revisionLabels: Record<RevisionColor, string> = {
+  white: '白纸版',
+  blue: '蓝纸版',
+  pink: '粉纸版',
+  yellow: '黄纸版',
+  green: '绿纸版',
+  goldenrod: '金菊版',
+  buff: '浅黄版',
+  salmon: '鲑粉版',
+  cherry: '樱桃版'
+}
+
+export interface ReviewContext {
+  revision: RevisionColor
+  contentHash: string
+}
+
+interface Snapshot {
+  script: Script
+  reviews: ReviewMap
+}
+
+function isRevision(value: unknown): value is RevisionColor {
+  return typeof value === 'string' && revisionColors.includes(value as RevisionColor)
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  const record = value as Record<string, unknown>
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`
+}
+
+function hashContent(value: unknown): string {
+  const text = stableStringify(value)
+  let hash = 2166136261
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
   }
-  return { script: clone(sampleScript), reviews: {}, versions: [], updatedAt: new Date().toISOString() }
+  return `h${(hash >>> 0).toString(36)}`
+}
+
+function asArray<T>(value: unknown): T[] {
+  return Array.isArray(value) ? value.filter((item): item is T => item && typeof item === 'object') as T[] : []
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function normalizeScript(input: Partial<Script> | undefined, fallback: Script): Script {
+  const source = input && typeof input === 'object' ? input : {}
+  return {
+    title: typeof source.title === 'string' ? source.title : fallback.title,
+    writer: typeof source.writer === 'string' ? source.writer : fallback.writer,
+    draft: typeof source.draft === 'string' ? source.draft : fallback.draft,
+    scenes: asArray<Scene>(source.scenes).map((scene) => ({ ...scene })),
+    characters: asArray<Character>(source.characters).map((character) => ({ ...character })),
+    props: asArray<Prop>(source.props).map((prop) => ({ ...prop })),
+    wardrobes: asArray<Wardrobe>(source.wardrobes).map((wardrobe) => ({ ...wardrobe }))
+  }
+}
+
+export function getReviewContext(warning: WarningItem, script: Script): ReviewContext {
+  const sceneIndex = script.scenes.findIndex((scene) => scene.id === warning.sceneId)
+  const scene = script.scenes[sceneIndex]
+  const revision = isRevision(scene?.revision) ? scene.revision : WHITE
+
+  if (warning.type === 'character') {
+    const character = script.characters.find((item) => item.id === warning.subjectId)
+    const introducedAt = character ? script.scenes.findIndex((scene) => scene.id === character.introducedSceneId) : -1
+    const appearedBefore = character ? script.scenes.slice(0, Math.max(sceneIndex, 0)).some((item) => item.characterIds.includes(character.id)) : false
+    return { revision, contentHash: hashContent({ orderIndex: sceneIndex, introducedAt, appearedBefore, scene, character }) }
+  }
+
+  if (warning.type === 'prop') {
+    const prop = script.props.find((item) => item.id === warning.subjectId)
+    const introducedAt = prop ? script.scenes.findIndex((scene) => scene.id === prop.introducedSceneId) : -1
+    return { revision, contentHash: hashContent({ orderIndex: sceneIndex, introducedAt, scene, prop }) }
+  }
+
+  if (warning.type === 'wardrobe') {
+    const wardrobe = script.wardrobes.find((item) => item.id === warning.subjectId)
+    return { revision, contentHash: hashContent({ orderIndex: sceneIndex, scene, wardrobe }) }
+  }
+
+  const previousScene = sceneIndex > 0 ? script.scenes[sceneIndex - 1] : undefined
+  return { revision, contentHash: hashContent({ orderIndex: sceneIndex, scene, previousScene }) }
 }
 
 export function deriveWarnings(script: Script): WarningItem[] {
@@ -33,6 +129,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
       if (index > 0 && !charactersSeen.has(characterId) && introducedAt >= index) {
         warnings.push({
           id: `character-${scene.id}-${characterId}`,
+          subjectId: characterId,
           type: 'character',
           severity: index > 1 ? 'error' : 'warning',
           sceneId: scene.id,
@@ -51,6 +148,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
       if (!propsSeen.has(propId) && introducedAt > index) {
         warnings.push({
           id: `prop-${scene.id}-${propId}`,
+          subjectId: propId,
           type: 'prop',
           severity: 'error',
           sceneId: scene.id,
@@ -69,6 +167,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
       if (!wardrobe.timePeriods.includes(scene.dayNight)) {
         warnings.push({
           id: `wardrobe-${scene.id}-${characterId}-${wardrobeId}`,
+          subjectId: wardrobeId,
           type: 'wardrobe',
           severity: 'warning',
           sceneId: scene.id,
@@ -79,7 +178,7 @@ export function deriveWarnings(script: Script): WarningItem[] {
       }
     })
 
-    if (index > 0 && script.scenes[index - 1].storyTime && scene.storyTime && index > 0) {
+    if (index > 0 && script.scenes[index - 1].storyTime && scene.storyTime) {
       const previous = script.scenes[index - 1]
       const previousDay = previous.storyTime.match(/第\s*(\d+)\s*天/)?.[1]
       const currentDay = scene.storyTime.match(/第\s*(\d+)\s*天/)?.[1]
@@ -97,6 +196,127 @@ export function deriveWarnings(script: Script): WarningItem[] {
     }
   })
   return warnings
+}
+
+function normalizeReply(input: unknown): Reply {
+  const value = asRecord(input)
+  const createdAt = typeof value.createdAt === 'string' ? value.createdAt : new Date(0).toISOString()
+  return {
+    id: typeof value.id === 'string' ? value.id : id('reply'),
+    author: typeof value.author === 'string' && value.author.trim() ? value.author : '作者',
+    text: typeof value.text === 'string' ? value.text : '',
+    createdAt,
+    revision: isRevision(value.revision) ? value.revision : WHITE
+  }
+}
+
+function reviewKey(warningId: string, revision: RevisionColor, contentHash: string) {
+  return `${warningId}|${revision}|${contentHash}`
+}
+
+function normalizeRecord(warningId: string, input: unknown, context: ReviewContext | undefined, options: { fallbackKey?: string; preferContext?: boolean } = {}): ReviewRecord {
+  const { fallbackKey, preferContext = false } = options
+  const value = asRecord(input)
+  const replies = asArray<unknown>(value.replies).map(normalizeReply)
+  const createdAt = typeof value.createdAt === 'string' ? value.createdAt : new Date(0).toISOString()
+  const updatedAt = typeof value.updatedAt === 'string' ? value.updatedAt : createdAt
+  const status: WarningStatus = value.status === 'accepted' || value.status === 'ignored' || value.status === 'pending' ? value.status : 'pending'
+  const keyParts = fallbackKey?.split('|') ?? []
+  const revision = isRevision(value.revision)
+    ? value.revision
+    : isRevision(keyParts[1])
+      ? keyParts[1]
+      : WHITE
+  const contentHash = typeof value.contentHash === 'string' && value.contentHash
+    ? value.contentHash
+    : keyParts.length >= 3
+      ? keyParts.slice(2).join('|')
+      : preferContext && context
+        ? context.contentHash
+        : 'legacy-white'
+  return {
+    id: typeof value.id === 'string' ? value.id : id('review'),
+    warningId: typeof value.warningId === 'string' ? value.warningId : warningId,
+    status,
+    revision,
+    contentHash,
+    replies,
+    createdAt,
+    updatedAt
+  }
+}
+
+function normalizeReviewMapWithContext(input: unknown, script: Script) {
+  const source = asRecord(input)
+  const contexts = new Map<string, ReviewContext>(deriveWarnings(script).map((warning) => [warning.id, getReviewContext(warning, script)]))
+  const result: ReviewMap = {}
+
+  Object.entries(source).forEach(([threadId, rawThread]) => {
+    const threadValue = asRecord(rawThread)
+    const warningId = typeof threadValue.warningId === 'string' ? threadValue.warningId : threadId
+    const context = contexts.get(warningId)
+    const records: Record<string, ReviewRecord> = {}
+
+    if (threadValue.records && typeof threadValue.records === 'object' && !Array.isArray(threadValue.records)) {
+      Object.entries(asRecord(threadValue.records)).forEach(([key, rawRecord]) => {
+        const record = normalizeRecord(warningId, rawRecord, context, { fallbackKey: key })
+        records[reviewKey(warningId, record.revision, record.contentHash)] = record
+      })
+    } else {
+      const record = normalizeRecord(warningId, threadValue, context, { preferContext: true })
+      records[reviewKey(warningId, record.revision, record.contentHash)] = record
+    }
+
+    if (Object.keys(records).length) result[warningId] = { warningId, records }
+  })
+
+  return { result, contexts }
+}
+
+export function normalizeReviewMap(input: unknown, script: Script): ReviewMap {
+  return normalizeReviewMapWithContext(input, script).result
+}
+
+function normalizeVersion(input: unknown, index: number, scriptFallback: Script, legacyReviews: ReviewMap): Version {
+  const value = asRecord(input)
+  const script = normalizeScript(value.script as Partial<Script>, scriptFallback)
+  const hasReviews = Boolean(value.reviews && Object.keys(asRecord(value.reviews)).length)
+  const reviews = normalizeReviewMap(hasReviews ? value.reviews : legacyReviews, script)
+  return {
+    id: typeof value.id === 'string' ? value.id : id('version'),
+    name: typeof value.name === 'string' && value.name.trim() ? value.name : `版本 ${index + 1}`,
+    createdAt: typeof value.createdAt === 'string' ? value.createdAt : new Date(0).toISOString(),
+    script,
+    reviews
+  }
+}
+
+function normalizeState(input: unknown): ContinuityState | null {
+  if (!input || typeof input !== 'object') return null
+  const parsed = input as Partial<ContinuityState>
+  if (!parsed.script || typeof parsed.script !== 'object') return null
+  const script = normalizeScript(parsed.script, sampleScript)
+  const reviews = normalizeReviewMap(parsed.reviews ?? {}, script)
+  const versions = asArray<unknown>(parsed.versions).map((version, index) => normalizeVersion(version, index, script, reviews))
+  return {
+    script,
+    reviews,
+    versions,
+    updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : new Date().toISOString()
+  }
+}
+
+function initialState(): ContinuityState {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const normalized = normalizeState(JSON.parse(raw))
+      if (normalized) return normalized
+    }
+  } catch {
+    // Ignore an invalid local draft and restore the bundled example.
+  }
+  return { script: clone(sampleScript), reviews: {}, versions: [], updatedAt: new Date().toISOString() }
 }
 
 export function diffScript(base: Script, current: Script): DiffItem[] {
@@ -135,12 +355,78 @@ export function diffScript(base: Script, current: Script): DiffItem[] {
   return result
 }
 
+export function getActiveReview(thread: ReviewThread | undefined, context: ReviewContext): ReviewRecord | undefined {
+  return thread?.records[reviewKey(thread.warningId, context.revision, context.contentHash)]
+}
+
+export function diffReviewConclusions(baseScript: Script, currentScript: Script, baseReviews: ReviewMap, currentReviews: ReviewMap): ReviewConclusionDiff[] {
+  const baseWarnings = deriveWarnings(baseScript)
+  const currentWarnings = deriveWarnings(currentScript)
+  const baseById = new Map(baseWarnings.map((warning) => [warning.id, warning]))
+  const currentById = new Map(currentWarnings.map((warning) => [warning.id, warning]))
+  const warningIds = Array.from(new Set([...baseWarnings.map((warning) => warning.id), ...currentWarnings.map((warning) => warning.id)]))
+
+  const side = (warning: WarningItem | undefined, script: Script, reviews: ReviewMap) => {
+    if (!warning) return { exists: false, status: null, revision: null }
+    const record = getActiveReview(reviews[warning.id], getReviewContext(warning, script))
+    return { exists: true, status: (record?.status ?? 'pending') as WarningStatus, revision: record?.revision ?? null }
+  }
+
+  return warningIds.map((warningId) => {
+    const beforeWarning = baseById.get(warningId)
+    const afterWarning = currentById.get(warningId)
+    const before = side(beforeWarning, baseScript, baseReviews)
+    const after = side(afterWarning, currentScript, currentReviews)
+    const warning = afterWarning ?? beforeWarning
+    const scene = currentScript.scenes.find((item) => item.id === warning?.sceneId) ?? baseScript.scenes.find((item) => item.id === warning?.sceneId)
+    const changed = before.exists !== after.exists || before.status !== after.status || before.revision !== after.revision
+    return {
+      id: warningId,
+      warningId,
+      title: warning?.title ?? '已消失的连续性问题',
+      sceneNumber: scene?.number ?? '-',
+      changed,
+      before,
+      after
+    }
+  }).sort((a, b) => Number(b.changed) - Number(a.changed) || a.title.localeCompare(b.title, 'zh-CN'))
+}
+
+function mergeReviews(current: ReviewMap, frozen: ReviewMap): ReviewMap {
+  const merged = clone(current)
+  Object.entries(frozen).forEach(([warningId, frozenThread]) => {
+    const thread = merged[warningId] ?? { warningId, records: {} }
+    Object.entries(frozenThread.records).forEach(([key, frozenRecord]) => {
+      const currentRecord = thread.records[key]
+      if (!currentRecord) {
+        thread.records[key] = clone(frozenRecord)
+        return
+      }
+      const repliesById = new Map(currentRecord.replies.map((reply) => [reply.id, reply]))
+      frozenRecord.replies.forEach((reply) => {
+        if (!repliesById.has(reply.id)) repliesById.set(reply.id, reply)
+      })
+      thread.records[key] = {
+        ...clone(frozenRecord),
+        replies: Array.from(repliesById.values()).sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      }
+    })
+    merged[warningId] = thread
+  })
+  return merged
+}
+
 export function useContinuityStore() {
   const [state, setState] = useState<ContinuityState>(initialState)
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving'>('saved')
-  const undoRef = useRef<Script[]>([])
-  const redoRef = useRef<Script[]>([])
+  const undoRef = useRef<Snapshot[]>([])
+  const redoRef = useRef<Snapshot[]>([])
+  const versionsRef = useRef<Version[]>([])
   const saveTimer = useRef<number | undefined>(undefined)
+
+  useEffect(() => {
+    versionsRef.current = state.versions
+  }, [state.versions])
 
   useEffect(() => {
     setSaveStatus('saving')
@@ -152,23 +438,30 @@ export function useContinuityStore() {
     return () => window.clearTimeout(saveTimer.current)
   }, [state])
 
-  const mutate = useCallback((mutator: (script: Script) => void) => {
+  const commit = useCallback((updater: (draft: Snapshot, previous: ContinuityState) => Snapshot) => {
     setState((previous) => {
-      const next = clone(previous.script)
-      mutator(next)
-      undoRef.current.push(clone(previous.script))
+      const draft = { script: clone(previous.script), reviews: clone(previous.reviews) }
+      const next = updater(draft, previous)
+      undoRef.current.push({ script: clone(previous.script), reviews: clone(previous.reviews) })
       if (undoRef.current.length > 80) undoRef.current.shift()
       redoRef.current = []
-      return { ...previous, script: next, updatedAt: new Date().toISOString() }
+      return { ...previous, ...next, updatedAt: new Date().toISOString() }
     })
   }, [])
+
+  const mutate = useCallback((mutator: (script: Script) => void) => {
+    commit((draft) => {
+      mutator(draft.script)
+      return { script: draft.script, reviews: draft.reviews }
+    })
+  }, [commit])
 
   const undo = useCallback(() => {
     setState((previous) => {
       const target = undoRef.current.pop()
       if (!target) return previous
-      redoRef.current.push(clone(previous.script))
-      return { ...previous, script: target, updatedAt: new Date().toISOString() }
+      redoRef.current.push({ script: clone(previous.script), reviews: clone(previous.reviews) })
+      return { ...previous, ...target, updatedAt: new Date().toISOString() }
     })
   }, [])
 
@@ -176,8 +469,8 @@ export function useContinuityStore() {
     setState((previous) => {
       const target = redoRef.current.pop()
       if (!target) return previous
-      undoRef.current.push(clone(previous.script))
-      return { ...previous, script: target, updatedAt: new Date().toISOString() }
+      undoRef.current.push({ script: clone(previous.script), reviews: clone(previous.reviews) })
+      return { ...previous, ...target, updatedAt: new Date().toISOString() }
     })
   }, [])
 
@@ -279,49 +572,75 @@ export function useContinuityStore() {
     })
   }, [mutate])
 
-  const setReviewStatus = useCallback((warningId: string, status: WarningReview['status']) => {
-    setState((previous) => ({
-      ...previous,
-      reviews: {
-        ...previous.reviews,
-        [warningId]: { ...(previous.reviews[warningId] ?? { replies: [] }), status }
-      },
-      updatedAt: new Date().toISOString()
-    }))
-  }, [])
+  const setReviewStatus = useCallback((warningId: string, status: WarningStatus) => {
+    commit((draft) => {
+      const warning = deriveWarnings(draft.script).find((item) => item.id === warningId)
+      if (warning) {
+        const context = getReviewContext(warning, draft.script)
+        const key = reviewKey(warningId, context.revision, context.contentHash)
+        const thread = draft.reviews[warningId] ?? { warningId, records: {} }
+        const current = thread.records[key]
+        const timestamp = new Date().toISOString()
+        thread.records[key] = current
+          ? { ...current, status, updatedAt: timestamp }
+          : { id: id('review'), warningId, status, revision: context.revision, contentHash: context.contentHash, replies: [], createdAt: timestamp, updatedAt: timestamp }
+        draft.reviews[warningId] = thread
+      }
+      return { script: draft.script, reviews: draft.reviews }
+    })
+  }, [commit])
 
   const addReply = useCallback((warningId: string, author: string, text: string) => {
-    if (!text.trim()) return
-    const reply: Reply = { id: id('reply'), author, text: text.trim(), createdAt: new Date().toISOString() }
-    setState((previous) => ({
-      ...previous,
-      reviews: {
-        ...previous.reviews,
-        [warningId]: {
-          status: previous.reviews[warningId]?.status ?? 'pending',
-          replies: [...(previous.reviews[warningId]?.replies ?? []), reply]
-        }
-      },
-      updatedAt: new Date().toISOString()
-    }))
-  }, [])
+    const trimmed = text.trim()
+    if (!trimmed) return
+    commit((draft) => {
+      const warning = deriveWarnings(draft.script).find((item) => item.id === warningId)
+      if (warning) {
+        const context = getReviewContext(warning, draft.script)
+        const key = reviewKey(warningId, context.revision, context.contentHash)
+        const thread = draft.reviews[warningId] ?? { warningId, records: {} }
+        const timestamp = new Date().toISOString()
+        const current = thread.records[key]
+        const reply: Reply = { id: id('reply'), author: author.trim() || '作者', text: trimmed, createdAt: timestamp, revision: context.revision }
+        thread.records[key] = current
+          ? { ...current, replies: [...current.replies, reply], updatedAt: timestamp }
+          : { id: id('review'), warningId, status: 'pending', revision: context.revision, contentHash: context.contentHash, replies: [reply], createdAt: timestamp, updatedAt: timestamp }
+        draft.reviews[warningId] = thread
+      }
+      return { script: draft.script, reviews: draft.reviews }
+    })
+  }, [commit])
 
   const createVersion = useCallback((name: string) => {
-    const version: Version = { id: id('version'), name: name.trim() || `版本 ${state.versions.length + 1}`, createdAt: new Date().toISOString(), script: clone(state.script) }
-    setState((previous) => ({ ...previous, versions: [version, ...previous.versions] }))
-    return version
-  }, [state.script, state.versions.length])
+    const versionId = id('version')
+    const createdAt = new Date().toISOString()
+    let created: Version | undefined
+    setState((previous) => {
+      const version: Version = {
+        id: versionId,
+        name: name.trim() || `版本 ${previous.versions.length + 1}`,
+        createdAt,
+        script: clone(previous.script),
+        reviews: clone(previous.reviews)
+      }
+      created = version
+      versionsRef.current = [version, ...versionsRef.current]
+      return { ...previous, versions: versionsRef.current, updatedAt: new Date().toISOString() }
+    })
+    return created as Version
+  }, [])
 
   const restoreVersion = useCallback((versionId: string) => {
-    const version = state.versions.find((item) => item.id === versionId)
-    if (!version) return
-    mutate((script) => { Object.assign(script, clone(version.script)) })
-  }, [mutate, state.versions])
+    commit((draft, previous) => {
+      const version = versionsRef.current.find((item) => item.id === versionId)
+      if (!version) return { script: draft.script, reviews: draft.reviews }
+      return { script: clone(version.script), reviews: mergeReviews(draft.reviews, version.reviews) }
+    })
+  }, [commit])
 
   const reset = useCallback(() => {
-    mutate((script) => { Object.assign(script, clone(sampleScript)) })
-    setState((previous) => ({ ...previous, reviews: {} }))
-  }, [mutate])
+    commit(() => ({ script: clone(sampleScript), reviews: {} }))
+  }, [commit])
 
   return {
     state,

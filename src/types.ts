@@ -56,6 +56,7 @@ export interface Script {
 
 export interface WarningItem {
   id: string
+  subjectId?: string
   type: WarningType
   severity: 'error' | 'warning'
   sceneId: string
@@ -69,23 +70,38 @@ export interface Reply {
   author: string
   text: string
   createdAt: string
+  revision: RevisionColor
 }
 
-export interface WarningReview {
+export interface ReviewRecord {
+  id: string
+  warningId: string
   status: WarningStatus
+  revision: RevisionColor
+  contentHash: string
   replies: Reply[]
+  createdAt: string
+  updatedAt: string
 }
+
+export interface ReviewThread {
+  warningId: string
+  records: Record<string, ReviewRecord>
+}
+
+export type ReviewMap = Record<string, ReviewThread>
 
 export interface Version {
   id: string
   name: string
   createdAt: string
   script: Script
+  reviews: ReviewMap
 }
 
 export interface ContinuityState {
   script: Script
-  reviews: Record<string, WarningReview>
+  reviews: ReviewMap
   versions: Version[]
   updatedAt: string
 }
@@ -96,4 +112,20 @@ export interface DiffItem {
   field: string
   before: string
   after: string
+}
+
+export interface ReviewConclusionSide {
+  exists: boolean
+  status: WarningStatus | null
+  revision: RevisionColor | null
+}
+
+export interface ReviewConclusionDiff {
+  id: string
+  warningId: string
+  title: string
+  sceneNumber: string
+  changed: boolean
+  before: ReviewConclusionSide
+  after: ReviewConclusionSide
 }
